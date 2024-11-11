@@ -141,8 +141,9 @@ void ReplaceValueMutation::reset() { replaced = false; }
 void RandomMoveMutation::fixValuesInOperand(mlir::Operation& op,llvm::DenseMap<mlir::Value, bool>& valSet){
   for(size_t i=0;i<op.getNumOperands();++i){
     if(valSet.find(op.getOperand(i))!=valSet.end()){
-      op.setOperand(
-            i, mutator->getOrInsertRandomValue(op.getOperand(i).getType()));
+        auto opVal=mutator->getOrInsertRandomValue(op.getOperand(i).getType());
+        op.setOperand(
+            i, opVal);
     }
   }
   if(util::canVisitInside(op)){
@@ -437,8 +438,8 @@ bool FunctionMutator::canMutate(mlir::func::FuncOp &func)
 void FunctionMutator::init(std::shared_ptr<FunctionMutator> mutator)
 {
   mutations.push_back(std::make_unique<ReorderArgumentMutation>(mutator));
-  mutations.push_back(std::make_unique<RandomMoveMutation>(mutator));
   mutations.push_back(std::make_unique<ReplaceValueMutation>(mutator));
+  mutations.push_back(std::make_unique<RandomMoveMutation>(mutator));
   funcIt = FunctionMutatorIterator(mutator, *curFunc.getOperation());
   moveToNextMutant();
 }

@@ -154,6 +154,8 @@ void timeMode(unique_ptr<llvm::MemoryBuffer> srcBuffer, MLIRContext *context) {
       mutator.saveModule(getOutputFile(cnt));
       llvm::outs() << "Generated " + to_string(cnt) + "th copies in " +
                           to_string((cur).count()) + " seconds\n\n";
+    }else{
+        mutator.getCopy()->dump();
     }
     sum += cur;
     ++cnt;
@@ -185,6 +187,8 @@ void copyMode(unique_ptr<llvm::MemoryBuffer> srcBuffer, MLIRContext *context) {
     if (saveAll) {
       mutator.saveModule(getOutputFile(cnt));
       llvm::outs() << "Generted " + to_string(cnt) + "th copies\n\n";
+    }else{
+        mutator.getCopy()->dump();
     }
     ++cnt;
   }
