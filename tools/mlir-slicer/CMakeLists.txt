@@ -4,10 +4,9 @@ include(AddLLVM)
 # 1. Build object files to check warnings/errors before linking
 # /============================================================/
 
-set(PROJECT_OBJ "mlir-mutate-obj")
+set(PROJECT_OBJ "mlir-slicer-obj")
 add_library(${PROJECT_OBJ} OBJECT
-    ./utils/mutatorUtil.cpp
-    ./utils/mutator.cpp)
+    ./utils.cpp)
 
 # Check MLIR and LLVM headers and include
 target_include_directories(${PROJECT_OBJ} PUBLIC ${LLVM_INCLUDE_DIRS})
@@ -25,10 +24,10 @@ if(USE_LIBC)
 endif()
 
 # /============================================================/
-# 2. Build libmlir-mutate
+# 2. Build libmlir-slicer
 # /============================================================/
 
-set(PROJECT_LIB "mlirmutate")
+set(PROJECT_LIB "mlirslicer")
 add_library(${PROJECT_LIB})
 target_link_libraries(${PROJECT_LIB} PUBLIC ${PROJECT_OBJ})
 
@@ -48,7 +47,7 @@ endif()
 
 # Build executable
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_executable(mlir-mutate mlir-mutate.cpp)
-target_link_libraries(mlir-mutate ${PROJECT_LIB})
+add_executable(mlir-slicer mlir-slicer.cpp)
+target_link_libraries(mlir-slicer ${PROJECT_LIB})
 
 
