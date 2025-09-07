@@ -10,12 +10,14 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Type.h"
 
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <utility>
 #include <filesystem>
+#include <unordered_set>
 
 using namespace std;
 
@@ -66,6 +68,53 @@ std::unique_ptr<llvm::Module> openInputFile(llvm::LLVMContext &Context,
 }
 
 std::unordered_map<unsigned, unsigned> unaryOpsCnt, binaryOpsCnt, intrinsicCnt;
+
+std::string generateFunctionName(){
+    static size_t i=0;
+    auto result = std::string("auto_gen_func")+to_string(i);
+    i+=1;
+    return result;
+}
+
+llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::Instruction*> insts){
+    std::unordered_map<llvm::Value*,size_t> valSet;
+    std::unordered_map<llvm::Value*, llvm::Value*> valMapping;
+    //cloning all operations into a basic block
+    //and collecting function arguments
+    auto bb=llvm::BasicBlock::Create(ctx);
+    for(auto& inst:insts){
+        auto newInst = inst->clone();
+        for(size_t i=0;i<newInst->getNumOperands();++i){
+            auto ithOperand = newInst->getOperand(i);
+            if(valMapping.find(ithOperand)!=valMapping.end()){
+                newInst->setOperand(i, valMapping[ithOperand]);
+            }else{
+                valSet.emplace(ithOperand, 0);
+            }
+        }
+        newInst->insertInto(bb,bb->end());
+        valMapping.emplace(inst,newInst);
+    }
+
+    llvm::SmallVector<llvm::Type*> args;
+    for(auto& arg: valSet){
+        arg.second = args.size();
+        args.push_back(arg.first->getType());
+    }
+    auto functionType = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), args, false);
+    auto function = llvm::Function::Create(functionType, llvm::Function::ExternalLinkage, generateFunctionName());
+    bb->insertInto(function);
+    for(auto it = bb->begin();it!=bb->end();++it){
+        for(size_t i=0;i<it->getNumOperands();++i){
+            auto ithOperand = it->getOperand(i);
+            if(valSet.find(ithOperand)!=valSet.end()){
+                it->setOperand(i, function->getArg(valSet[ithOperand]));
+            }
+        }
+    }
+    auto returnInst = llvm::ReturnInst::Create(ctx, bb);
+    return function;
+}
 
 void updateCntMap(std::unordered_map<unsigned, unsigned>& umap, unsigned opCode){
     if(umap.find(opCode)==umap.end()){
