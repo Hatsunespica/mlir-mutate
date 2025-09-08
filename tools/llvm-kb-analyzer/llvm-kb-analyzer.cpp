@@ -35,10 +35,10 @@ namespace {
 
 
     llvm::cl::opt<bool>
-            saveAll(
-    "saveAll",
-    llvm::cl::value_desc("save all mutants"),
-    llvm::cl::desc("Save mutants to disk (default=false)"),
+            collectInstructions(
+    "collect-instructions",
+    llvm::cl::value_desc("collect instructions"),
+    llvm::cl::desc("Collect and count instructions"),
     llvm::cl::cat(mutatorArgs), llvm::cl::init(false)
     );
 
@@ -72,6 +72,28 @@ void updateCntMap(std::unordered_map<unsigned, unsigned>& umap, unsigned opCode)
         umap.emplace(opCode, 0);
     }
     umap[opCode]+=1;
+}
+
+unsigned totalBits, totalKB;
+
+void countKB(llvm::Instruction* inst, const llvm::DataLayout& layout){
+    auto bitwidth = inst->getType()->getIntegerBitWidth();
+    llvm::KnownBits kb(bitwidth);
+    llvm::computeKnownBits(inst, kb,layout);
+    auto bits = kb.getBitWidth();
+    auto knownBits = (~(kb.Zero | kb.One)).popcount();
+    totalBits+=bits;
+    totalKB+=(bits-knownBits);
+}
+
+void walkKBModule(std::shared_ptr<llvm::Module> module){
+    for(llvm::Function& func:*module){
+        for(auto it=llvm::inst_begin(func), end_it = llvm::inst_end(func);it!=end_it;++it){
+            if(it->getType()->isIntOrIntVectorTy()){
+                countKB(&*it, module->getDataLayout());
+            }
+        }
+    }
 }
 
 void walkModule(std::shared_ptr<llvm::Module> module){
@@ -127,6 +149,8 @@ std::string getUnaryOrBinaryOpName(unsigned opcode) {
 }
 
 void printResult(){
+    llvm::errs()<<"Total bits: "<<totalBits<<"\nTotal Known Bits: "<<totalKB<<"\n";
+    if(!collectInstructions)return;
     llvm::errs()<<"Unary operation counts:\n";
     for(const auto& p:unaryOpsCnt){
         llvm::errs()<<getUnaryOrBinaryOpName(p.first)<<"\t"<<p.second<<"\n";
@@ -167,7 +191,10 @@ see alive-mutate --help for more options,
         outputFolder += '/';
 
     //M1->dump();
-    walkModule(M1);
+    if(collectInstructions){
+        walkModule(M1);
+    }
+    walkKBModule(M1);
     printResult();
     return 0;
 }
