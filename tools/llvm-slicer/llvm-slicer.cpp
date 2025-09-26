@@ -5,6 +5,9 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Signals.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/IRReader/IRReader.h"
@@ -34,6 +37,13 @@ namespace {
                                         llvm::cl::desc("<outputFileFolder>"),
                                         llvm::cl::value_desc("folder"),
                                         llvm::cl::cat(mutatorArgs));
+
+
+    llvm::cl::opt <int> depth("depth",
+                                        llvm::cl::desc("slice depth"),
+                                        llvm::cl::value_desc("folder"),
+                                        llvm::cl::cat(mutatorArgs),
+                                        llvm::cl::init(-1));
 
 
     llvm::cl::opt<bool>
@@ -68,12 +78,20 @@ std::unique_ptr<llvm::Module> openInputFile(llvm::LLVMContext &Context,
 }
 
 std::unordered_map<unsigned, unsigned> unaryOpsCnt, binaryOpsCnt, intrinsicCnt;
+unsigned saveFuncs;
 
 std::string generateFunctionName(){
     static size_t i=0;
     auto result = std::string("auto_gen_func")+to_string(i);
     i+=1;
     return result;
+}
+
+std::string getOutputPath(std::string&& fileName){
+    if(outputFolder.back() == '/'){
+        return outputFolder+fileName;
+    }
+    return outputFolder+'/'+fileName;
 }
 
 llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::Instruction*> insts){
@@ -84,6 +102,7 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
     auto bb=llvm::BasicBlock::Create(ctx);
     for(auto& inst:insts){
         auto newInst = inst->clone();
+        newInst->setMetadata(llvm::LLVMContext::MD_tbaa, nullptr);
         for(size_t i=0;i<newInst->getNumOperands();++i){
             auto ithOperand = newInst->getOperand(i);
             if(valMapping.find(ithOperand)!=valMapping.end()){
@@ -116,6 +135,19 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
     return function;
 }
 
+void saveFunctionToFile(llvm::Function* func, const std::string &Path) {
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(Path, EC, llvm::sys::fs::OF_Text);
+
+    if (EC) {
+        llvm::errs() << "Error opening file " << Path << ": " << EC.message() << "\n";
+        return;
+    }
+
+    // Print only the function body (with definition).
+    func->print(OS, nullptr);
+}
+
 void updateCntMap(std::unordered_map<unsigned, unsigned>& umap, unsigned opCode){
     if(umap.find(opCode)==umap.end()){
         umap.emplace(opCode, 0);
@@ -123,9 +155,58 @@ void updateCntMap(std::unordered_map<unsigned, unsigned>& umap, unsigned opCode)
     umap[opCode]+=1;
 }
 
-void walkModule(std::shared_ptr<llvm::Module> module){
+bool isCallToNonIntrinsic(const llvm::Instruction *I) {
+    // Check if it's a call (could also be InvokeInst in some cases)
+    if (const auto *CI = llvm::dyn_cast<llvm::CallBase>(I)) {
+        if (const llvm::Function *Callee = CI->getCalledFunction()) {
+            return !Callee->isIntrinsic();
+        }
+    }
+    return false;
+}
+
+bool specialCheck(const llvm::Instruction *I) {
+    return llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::LandingPadInst>(I)
+           || isCallToNonIntrinsic(I) || llvm::isa<llvm::LoadInst>(I)
+           || llvm::isa<llvm::AllocaInst>(I) || llvm::isa<llvm::StoreInst>(I)
+           || !llvm::isa<llvm::Operator>(I)
+           || llvm::isa<llvm::ICmpInst>(I) || llvm::isa<llvm::ZExtInst>(I)
+           || llvm::isa<llvm::SExtInst>(I) || llvm::isa<llvm::TruncInst>(I)
+           || llvm::isa<llvm::GetElementPtrInst>(I) || llvm::isa<llvm::SelectInst>(I);
+}
+
+void sliceInstruction(llvm::Instruction* inst, llvm::SmallVector<llvm::Instruction*>& insts, int depth){
+    if(depth!=0&&!specialCheck(inst)){
+        insts.push_back(inst);
+        for(size_t i=0;i<inst->getNumOperands();++i){
+            auto operand_inst = llvm::dyn_cast<llvm::Instruction>(inst->getOperand(i));
+            if(operand_inst){
+                sliceInstruction(operand_inst, insts, depth-1);
+            }
+        }
+    }
+}
+
+void walkModule(std::shared_ptr<llvm::Module> module, int depth){
+    bool shouldSlice = depth >1;
+    llvm::SmallVector<llvm::Instruction*> insts;
     for(llvm::Function& func:*module){
         for(auto it=llvm::inst_begin(func), end_it = llvm::inst_end(func);it!=end_it;++it){
+            //Slice on the current instruction
+            if(shouldSlice && !it->isTerminator()&& !specialCheck(&*it)){
+                sliceInstruction(&*it, insts, depth);
+                if(insts.size()>1){
+                    std::reverse(insts.begin(), insts.end());
+                    auto func = moveToFunction(module->getContext(), insts);
+
+                    auto outputPath = getOutputPath(func->getName().str());
+                    saveFunctionToFile(func,outputPath);
+                    ++saveFuncs;
+                }
+                insts.clear();
+            }
+
+            //count ops
             unsigned opCode = it->getOpcode();
             if(auto callInst = llvm::dyn_cast<llvm::CallBase>(&*it);callInst){
                 auto intrinsicID = callInst->getIntrinsicID();
@@ -176,6 +257,7 @@ std::string getUnaryOrBinaryOpName(unsigned opcode) {
 }
 
 void printResult(){
+    llvm::errs()<<"Function saved: "<<saveFuncs<<"\n";
     llvm::errs()<<"Unary operation counts:\n";
     for(const auto& p:unaryOpsCnt){
         llvm::errs()<<getUnaryOrBinaryOpName(p.first)<<"\t"<<p.second<<"\n";
@@ -216,7 +298,7 @@ see alive-mutate --help for more options,
         outputFolder += '/';
 
     //M1->dump();
-    walkModule(M1);
+    walkModule(M1, depth);
     printResult();
     return 0;
 }
