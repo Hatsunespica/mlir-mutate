@@ -21,6 +21,7 @@
 #include <utility>
 #include <filesystem>
 #include <unordered_set>
+#include <regex>
 
 using namespace std;
 
@@ -120,7 +121,7 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
         arg.second = args.size();
         args.push_back(arg.first->getType());
     }
-    auto functionType = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), args, false);
+    auto functionType = llvm::FunctionType::get(insts.back()->getType(), args, false);
     auto function = llvm::Function::Create(functionType, llvm::Function::ExternalLinkage, generateFunctionName());
     bb->insertInto(function);
     for(auto it = bb->begin();it!=bb->end();++it){
@@ -131,12 +132,12 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
             }
         }
     }
-    auto returnInst = llvm::ReturnInst::Create(ctx, bb);
+    auto returnInst = llvm::ReturnInst::Create(ctx, &bb->back(), bb);
     return function;
 }
 
 void saveFunctionToFile(llvm::Function* func, const std::string &Path) {
-    std::error_code EC;
+    /*std::error_code EC;
     llvm::raw_fd_ostream OS(Path, EC, llvm::sys::fs::OF_Text);
 
     if (EC) {
@@ -145,7 +146,34 @@ void saveFunctionToFile(llvm::Function* func, const std::string &Path) {
     }
 
     // Print only the function body (with definition).
-    func->print(OS, nullptr);
+    func->print(OS, nullptr);*/
+    using namespace llvm;
+    if (!func) {
+        errs() << "Error: null Function pointer.\n";
+        return;
+    }
+
+    // 1. Dump the function IR to a string
+    std::string funcStr;
+    {
+        raw_string_ostream rso(funcStr);
+        func->print(rso);
+    }
+
+    // 2. Remove all integer type patterns (i1, i8, i16, i32, i64, etc.)
+    std::regex intTypeRegex(R"(i[0-9]+)");
+    std::string cleaned = std::regex_replace(funcStr, intTypeRegex, "%int");
+
+    // 3. Save to file
+    std::ofstream outFile(Path);
+    if (!outFile) {
+        llvm::errs() << "Error: cannot open file for writing: " << Path << "\n";
+        return;
+    }
+
+    outFile << cleaned;
+    outFile.close();
+
 }
 
 void updateCntMap(std::unordered_map<unsigned, unsigned>& umap, unsigned opCode){
@@ -167,16 +195,40 @@ bool isCallToNonIntrinsic(const llvm::Instruction *I) {
 
 bool specialCheck(const llvm::Instruction *I) {
     return llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::LandingPadInst>(I)
-           || isCallToNonIntrinsic(I) || llvm::isa<llvm::LoadInst>(I)
+           //|| isCallToNonIntrinsic(I)
+           ||llvm::isa<llvm::CallBase>(I)
+           || llvm::isa<llvm::LoadInst>(I)
            || llvm::isa<llvm::AllocaInst>(I) || llvm::isa<llvm::StoreInst>(I)
            || !llvm::isa<llvm::Operator>(I)
            || llvm::isa<llvm::ICmpInst>(I) || llvm::isa<llvm::ZExtInst>(I)
            || llvm::isa<llvm::SExtInst>(I) || llvm::isa<llvm::TruncInst>(I)
-           || llvm::isa<llvm::GetElementPtrInst>(I) || llvm::isa<llvm::SelectInst>(I);
+           || llvm::isa<llvm::GetElementPtrInst>(I) || llvm::isa<llvm::SelectInst>(I)
+           || llvm::isa<llvm::PtrToIntInst>(I);
+}
+
+void canonicalizeFunction(llvm::Function* func){
+    size_t idx =0;
+    for(auto arg_it = func->arg_begin();arg_it!=func->arg_end();++arg_it){
+        arg_it->setName(to_string(idx));
+        ++idx;
+    }
+    for(auto it=llvm::inst_begin(func);it!=llvm::inst_end(func);++it){
+        if(it->isCommutative()){
+            if(it->getOperand(0)->getName()>it->getOperand(1)->getName()){
+                auto val=it->getOperand(1);
+                it->setOperand(1, it->getOperand(0));
+                it->setOperand(0, val);
+            }
+        }
+        if(it->getType()!=llvm::Type::getVoidTy(func->getContext())){
+            it->setName(to_string(idx));
+            idx+=1;
+        }
+    }
 }
 
 void sliceInstruction(llvm::Instruction* inst, llvm::SmallVector<llvm::Instruction*>& insts, int depth){
-    if(depth!=0&&!specialCheck(inst)){
+    if(depth!=0&&inst->getType()->isIntegerTy()&&!specialCheck(inst)){
         insts.push_back(inst);
         for(size_t i=0;i<inst->getNumOperands();++i){
             auto operand_inst = llvm::dyn_cast<llvm::Instruction>(inst->getOperand(i));
@@ -198,8 +250,9 @@ void walkModule(std::shared_ptr<llvm::Module> module, int depth){
                 if(insts.size()>1){
                     std::reverse(insts.begin(), insts.end());
                     auto func = moveToFunction(module->getContext(), insts);
-
+                    canonicalizeFunction(func);
                     auto outputPath = getOutputPath(func->getName().str());
+                    func->setName("tmp");
                     saveFunctionToFile(func,outputPath);
                     ++saveFuncs;
                 }
