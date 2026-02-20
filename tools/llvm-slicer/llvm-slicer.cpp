@@ -47,12 +47,13 @@ namespace {
                                         llvm::cl::init(-1));
 
 
-    llvm::cl::opt<bool>
-            saveAll(
-    "saveAll",
-    llvm::cl::value_desc("save all mutants"),
-    llvm::cl::desc("Save mutants to disk (default=false)"),
-    llvm::cl::cat(mutatorArgs), llvm::cl::init(false)
+    llvm::cl::list<int> patternSize(
+            "pattern-size",
+            llvm::cl::desc("Pattern sizes"),
+            llvm::cl::value_desc("s1,s2,s3,..."),
+            llvm::cl::CommaSeparated,
+            llvm::cl::cat(mutatorArgs),
+            llvm::cl::ZeroOrMore
     );
 
 
@@ -61,7 +62,6 @@ namespace {
 std::string getOutputSrcFilename(int ith);
 bool isValidOutputPath();
 
-llvm::StringSet<> invalidFunctions;
 static llvm::ExitOnError ExitOnErr;
 std::unique_ptr<llvm::Module> openInputFile(llvm::LLVMContext &Context,
                                             const string &InputFilename) {
@@ -196,11 +196,14 @@ bool isCallToNonIntrinsic(const llvm::Instruction *I) {
 bool specialCheck(const llvm::Instruction *I) {
     return llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::LandingPadInst>(I)
            //|| isCallToNonIntrinsic(I)
+           || llvm::isa<llvm::AtomicRMWInst>(I)
            ||llvm::isa<llvm::CallBase>(I)
            || llvm::isa<llvm::LoadInst>(I)
            || llvm::isa<llvm::AllocaInst>(I) || llvm::isa<llvm::StoreInst>(I)
            || !llvm::isa<llvm::Operator>(I)
-           || llvm::isa<llvm::ICmpInst>(I) || llvm::isa<llvm::ZExtInst>(I)
+           || llvm::isa<llvm::UnaryInstruction>(I)
+           //|| llvm::isa<llvm::ICmpInst>(I)
+           || llvm::isa<llvm::ZExtInst>(I)
            || llvm::isa<llvm::SExtInst>(I) || llvm::isa<llvm::TruncInst>(I)
            || llvm::isa<llvm::GetElementPtrInst>(I) || llvm::isa<llvm::SelectInst>(I)
            || llvm::isa<llvm::PtrToIntInst>(I);
@@ -227,6 +230,95 @@ void canonicalizeFunction(llvm::Function* func){
     }
 }
 
+
+int getDAGSize(llvm::Value* val, std::unordered_map<llvm::Value*, int>& sizeMap){
+    auto it=sizeMap.find(val);
+    if(it==sizeMap.end()){
+        auto inst = llvm::dyn_cast_or_null<llvm::Instruction>(val);
+        if(!inst){
+            sizeMap.emplace(val, 0);
+        }else{
+            sizeMap.emplace(val, getDAGSize(inst->getOperand(0), sizeMap)+
+                                 getDAGSize(inst->getOperand(1), sizeMap)+1);
+        }
+        return sizeMap[val];
+    }else{
+        return it->second;
+    }
+}
+
+
+
+std::vector<llvm::Value*> enumeratePatternHelper(llvm::Value* v, int size, std::unordered_map<llvm::Value*, int>& sizeMap){
+    if(!llvm::isa<llvm::Instruction>(v) || size == 0){
+        return {v};
+    }
+    llvm::Instruction* inst = llvm::dyn_cast<llvm::Instruction>(v);
+    std::vector<llvm::Value*> result;
+    int lhsSize= getDAGSize(inst->getOperand(0), sizeMap), rhsSize= getDAGSize(inst->getOperand(1), sizeMap);
+    int  lhsUpperBound = min(lhsSize, size-1), lhsLowerBound=max(0, size-1-rhsSize);
+
+    for(int lhs=lhsLowerBound,rhs=size-1-lhs;lhs<=lhsUpperBound&&rhs>=0;++lhs, --rhs){
+        auto lhsValues = enumeratePatternHelper(inst->getOperand(0), lhs, sizeMap);
+        auto rhsValues = enumeratePatternHelper(inst->getOperand(1), rhs, sizeMap);
+        for(const auto& lhsVal :lhsValues){
+            for(const auto& rhsVal :rhsValues){
+                auto cloneInst = inst->clone();
+                cloneInst->setOperand(0, lhsVal);
+                cloneInst->setOperand(1, rhsVal);
+                result.push_back(cloneInst);
+            }
+        }
+    }
+    return result;
+}
+
+llvm::Function* copyToFunction(llvm::Instruction* source){
+    auto& context = source->getContext();
+    llvm::SmallVector<llvm::Instruction*> insts, stack{source};
+    while(!stack.empty()){
+        auto inst = stack.back();
+        stack.pop_back();
+        insts.push_back(inst);
+        for(int i=0;i<2;++i){
+
+            if(auto operand = llvm::dyn_cast_or_null<llvm::Instruction>(inst->getOperand(i));operand&&operand->getParent()==nullptr){
+                stack.push_back(llvm::dyn_cast<llvm::Instruction>(operand));
+            }
+        }
+    }
+    reverse(insts.begin(), insts.end());
+    return moveToFunction(context, insts);
+}
+
+llvm::Value* getUniqueReturn(llvm::Function* func){
+    llvm::Value *uniqueResult = nullptr;
+    for (llvm::BasicBlock &BB : *func) {
+        if (llvm::ReturnInst *RI = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator())) {
+            llvm::Value *RV = RI->getReturnValue();
+            if (!RV) assert(false && "Return void type");
+            if (!uniqueResult) uniqueResult = RV;
+            else if (uniqueResult != RV) assert(false && "Return multiple value");
+        }
+    }
+    if (!uniqueResult) assert(false && "Return void type");
+    return uniqueResult;
+}
+
+
+std::vector<llvm::Function*> enumeratePatternWithSize(llvm::Function* func, int size, std::unordered_map<llvm::Value*, int>& sizeMap){
+    llvm::Value *uniqueResult = getUniqueReturn(func);
+    auto result= enumeratePatternHelper(uniqueResult, size, sizeMap);
+    std::vector<llvm::Function*> funcResult;
+    for(auto val:result){
+
+        if(auto inst = llvm::dyn_cast_or_null<llvm::Instruction>(val);inst){
+            funcResult.push_back(copyToFunction(inst));
+        }
+    }
+    return funcResult;
+}
+
 void sliceInstruction(llvm::Instruction* inst, llvm::SmallVector<llvm::Instruction*>& insts, int depth){
     if(depth!=0&&inst->getType()->isIntegerTy()&&!specialCheck(inst)){
         insts.push_back(inst);
@@ -239,7 +331,7 @@ void sliceInstruction(llvm::Instruction* inst, llvm::SmallVector<llvm::Instructi
     }
 }
 
-void walkModule(std::shared_ptr<llvm::Module> module, int depth){
+void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vector<int>& patternSizeVec){
     bool shouldSlice = depth >1;
     llvm::SmallVector<llvm::Instruction*> insts;
     for(llvm::Function& func:*module){
@@ -247,14 +339,34 @@ void walkModule(std::shared_ptr<llvm::Module> module, int depth){
             //Slice on the current instruction
             if(shouldSlice && !it->isTerminator()&& !specialCheck(&*it)){
                 sliceInstruction(&*it, insts, depth);
-                if(insts.size()>1){
+                if(insts.size()>=1){
                     std::reverse(insts.begin(), insts.end());
                     auto func = moveToFunction(module->getContext(), insts);
                     canonicalizeFunction(func);
                     auto outputPath = getOutputPath(func->getName().str());
                     func->setName("tmp");
-                    saveFunctionToFile(func,outputPath);
-                    ++saveFuncs;
+                    //exclude the last return instruction
+                    auto funcSize = func->getInstructionCount()-1;
+                    std::unordered_map<llvm::Value*, int> sizeMap;
+                    if(!patternSizeVec.empty()){
+                        //llvm::errs()<<"AAAAAA"<<funcSize<<"\n";
+                        for(int i=0;i<patternSizeVec.size()&&patternSizeVec[i]<=funcSize;++i){
+                            //llvm::errs()<<"Current size: "<<patternSizeVec[i]<<"\n";
+
+                            auto patterns = enumeratePatternWithSize(func, patternSizeVec[i], sizeMap);
+                            for(auto pattern:patterns){
+
+                                canonicalizeFunction(pattern);
+                                outputPath = getOutputPath(pattern->getName().str());
+                                pattern->setName("tmp");
+                                saveFunctionToFile(pattern, outputPath);
+                                ++saveFuncs;
+                            }
+                        }
+                    }else{
+                        saveFunctionToFile(func,outputPath);
+                        ++saveFuncs;
+                    }
                 }
                 insts.clear();
             }
@@ -350,8 +462,13 @@ see alive-mutate --help for more options,
     if (outputFolder.back() != '/')
         outputFolder += '/';
 
+    std::vector<int> patternSizeVec;
+    for(int x:patternSize){
+        patternSizeVec.push_back(x);
+    }
+    sort(patternSizeVec.begin(), patternSizeVec.end());
     //M1->dump();
-    walkModule(M1, depth);
+    walkModule(M1, depth, patternSizeVec);
     printResult();
     return 0;
 }
