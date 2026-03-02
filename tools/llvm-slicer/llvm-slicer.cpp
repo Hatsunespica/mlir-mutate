@@ -164,6 +164,9 @@ void saveFunctionToFile(llvm::Function* func, const std::string &Path) {
     std::regex intTypeRegex(R"(i[0-9]+)");
     std::string cleaned = std::regex_replace(funcStr, intTypeRegex, "%int");
 
+    std::regex removeAddrspace(R"(addrspace\(0\))");
+    cleaned = std::regex_replace(cleaned, removeAddrspace, "");
+
     // 3. Save to file
     std::ofstream outFile(Path);
     if (!outFile) {
@@ -202,17 +205,24 @@ bool specialCheck(const llvm::Instruction *I) {
            || llvm::isa<llvm::AllocaInst>(I) || llvm::isa<llvm::StoreInst>(I)
            || !llvm::isa<llvm::Operator>(I)
            || llvm::isa<llvm::UnaryInstruction>(I)
-           //|| llvm::isa<llvm::ICmpInst>(I)
+           || llvm::isa<llvm::ICmpInst>(I)
            || llvm::isa<llvm::ZExtInst>(I)
            || llvm::isa<llvm::SExtInst>(I) || llvm::isa<llvm::TruncInst>(I)
            || llvm::isa<llvm::GetElementPtrInst>(I) || llvm::isa<llvm::SelectInst>(I)
            || llvm::isa<llvm::PtrToIntInst>(I);
 }
 
+std::string getUniqueName(size_t idx){
+    // Required from Prof. John for readability.
+    // %a-%z is easier than %"0" - %"n"
+    assert(idx<26 && "used up all a-z characters");
+    return string(1, 'a'+idx);
+}
+
 void canonicalizeFunction(llvm::Function* func){
     size_t idx =0;
     for(auto arg_it = func->arg_begin();arg_it!=func->arg_end();++arg_it){
-        arg_it->setName(to_string(idx));
+        arg_it->setName(getUniqueName(idx));
         ++idx;
     }
     for(auto it=llvm::inst_begin(func);it!=llvm::inst_end(func);++it){
@@ -224,7 +234,7 @@ void canonicalizeFunction(llvm::Function* func){
             }
         }
         if(it->getType()!=llvm::Type::getVoidTy(func->getContext())){
-            it->setName(to_string(idx));
+            it->setName(getUniqueName(idx));
             idx+=1;
         }
     }
