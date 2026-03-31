@@ -46,6 +46,11 @@ namespace {
                                         llvm::cl::cat(mutatorArgs),
                                         llvm::cl::init(-1));
 
+    llvm::cl::opt <bool> sliceConstant("slice-constant",
+                              llvm::cl::desc("slice constant"),
+                              llvm::cl::value_desc("bool"),
+                              llvm::cl::cat(mutatorArgs),
+                              llvm::cl::init(false));
 
     llvm::cl::list<int> patternSize(
             "pattern-size",
@@ -109,7 +114,11 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
             if(valMapping.find(ithOperand)!=valMapping.end()){
                 newInst->setOperand(i, valMapping[ithOperand]);
             }else{
-                valSet.emplace(ithOperand, 0);
+                if(auto constantInt = llvm::dyn_cast_or_null<llvm::ConstantInt>(ithOperand);sliceConstant && constantInt){
+
+                }else{
+                    valSet.emplace(ithOperand, -1);
+                }
             }
         }
         newInst->insertInto(bb,bb->end());
@@ -134,6 +143,23 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
     }
     auto returnInst = llvm::ReturnInst::Create(ctx, &bb->back(), bb);
     return function;
+}
+
+std::string replaceIntConstantsWithSymbols(const std::string& input) {
+    std::regex intConstants(R"( [-]?[0-9]+)");
+    std::string output;
+    std::string::const_iterator searchStart = input.cbegin();
+    std::smatch match;
+    int counter = 1;
+
+    while (std::regex_search(searchStart, input.cend(), match, intConstants)) {
+        output.append(match.prefix().first, match.prefix().second); // text before match
+        output += " C" + std::to_string(counter++);                 // replacement
+        searchStart = match.suffix().first;                         // continue after match
+    }
+
+    output.append(searchStart, input.cend()); // tail
+    return output;
 }
 
 void saveFunctionToFile(llvm::Function* func, const std::string &Path) {
@@ -166,6 +192,11 @@ void saveFunctionToFile(llvm::Function* func, const std::string &Path) {
 
     std::regex removeAddrspace(R"(addrspace\(0\))");
     cleaned = std::regex_replace(cleaned, removeAddrspace, "");
+
+    //option, replace constant
+    if(sliceConstant){
+        cleaned = replaceIntConstantsWithSymbols(cleaned);
+    }
 
     // 3. Save to file
     std::ofstream outFile(Path);
@@ -257,7 +288,7 @@ int getDAGSize(llvm::Value* val, std::unordered_map<llvm::Value*, int>& sizeMap)
     }
 }
 
-
+std::vector<llvm::Instruction*> eraseList;
 
 std::vector<llvm::Value*> enumeratePatternHelper(llvm::Value* v, int size, std::unordered_map<llvm::Value*, int>& sizeMap){
     if(!llvm::isa<llvm::Instruction>(v) || size == 0){
@@ -274,6 +305,7 @@ std::vector<llvm::Value*> enumeratePatternHelper(llvm::Value* v, int size, std::
         for(const auto& lhsVal :lhsValues){
             for(const auto& rhsVal :rhsValues){
                 auto cloneInst = inst->clone();
+                eraseList.push_back(cloneInst);
                 cloneInst->setOperand(0, lhsVal);
                 cloneInst->setOperand(1, rhsVal);
                 result.push_back(cloneInst);
@@ -326,6 +358,11 @@ std::vector<llvm::Function*> enumeratePatternWithSize(llvm::Function* func, int 
             funcResult.push_back(copyToFunction(inst));
         }
     }
+    for(auto instIt=eraseList.rbegin(); instIt!=eraseList.rend();++instIt){
+        assert((*instIt)->getParent()==nullptr);
+        (*instIt)->deleteValue();
+    }
+    eraseList.clear();
     return funcResult;
 }
 
@@ -358,25 +395,29 @@ void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vect
                     //exclude the last return instruction
                     auto funcSize = func->getInstructionCount()-1;
                     std::unordered_map<llvm::Value*, int> sizeMap;
+                    func->dump();
                     if(!patternSizeVec.empty()){
                         //llvm::errs()<<"AAAAAA"<<funcSize<<"\n";
                         for(int i=0;i<patternSizeVec.size()&&patternSizeVec[i]<=funcSize;++i){
-                            //llvm::errs()<<"Current size: "<<patternSizeVec[i]<<"\n";
+                            llvm::errs()<<"Current size: "<<patternSizeVec[i]<<"\n";
 
                             auto patterns = enumeratePatternWithSize(func, patternSizeVec[i], sizeMap);
                             for(auto pattern:patterns){
-
                                 canonicalizeFunction(pattern);
                                 outputPath = getOutputPath(pattern->getName().str());
                                 pattern->setName("tmp");
                                 saveFunctionToFile(pattern, outputPath);
                                 ++saveFuncs;
                             }
+                            for(auto pattern: patterns){
+                                pattern->erase(pattern->begin(), pattern->end());
+                            }
                         }
                     }else{
                         saveFunctionToFile(func,outputPath);
                         ++saveFuncs;
                     }
+                    func->erase(func->begin(), func->end());
                 }
                 insts.clear();
             }
