@@ -52,6 +52,12 @@ namespace {
                               llvm::cl::cat(mutatorArgs),
                               llvm::cl::init(false));
 
+    llvm::cl::opt <bool> PRINTRESULT("print-result",
+                                       llvm::cl::desc("print result"),
+                                       llvm::cl::value_desc("bool"),
+                                       llvm::cl::cat(mutatorArgs),
+                                       llvm::cl::init(true));
+
     llvm::cl::list<int> patternSize(
             "pattern-size",
             llvm::cl::desc("Pattern sizes"),
@@ -395,11 +401,10 @@ void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vect
                     //exclude the last return instruction
                     auto funcSize = func->getInstructionCount()-1;
                     std::unordered_map<llvm::Value*, int> sizeMap;
-                    func->dump();
                     if(!patternSizeVec.empty()){
                         //llvm::errs()<<"AAAAAA"<<funcSize<<"\n";
                         for(int i=0;i<patternSizeVec.size()&&patternSizeVec[i]<=funcSize;++i){
-                            llvm::errs()<<"Current size: "<<patternSizeVec[i]<<"\n";
+                            //llvm::errs()<<"Current size: "<<patternSizeVec[i]<<"\n";
 
                             auto patterns = enumeratePatternWithSize(func, patternSizeVec[i], sizeMap);
                             for(auto pattern:patterns){
@@ -520,7 +525,9 @@ see alive-mutate --help for more options,
     sort(patternSizeVec.begin(), patternSizeVec.end());
     //M1->dump();
     walkModule(M1, depth, patternSizeVec);
-    printResult();
+    if(PRINTRESULT){
+        printResult();
+    }
     return 0;
 }
 
